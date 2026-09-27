@@ -176,7 +176,9 @@ def convert_file(path):
                             or stripped.startswith("<local-command-caveat>")
                             or stripped.startswith("<command-name>")
                             or stripped.startswith("<local-command-stdout>")
-                            or stripped.startswith("<pasted_content")):
+                            or stripped.startswith("<pasted_content")
+                            or stripped.startswith("<task-notification")
+                            or stripped.startswith("<system-reminder")):
                         continue
                 else:
                     continue
@@ -287,7 +289,7 @@ def convert_file(path):
 
     if not title:
         for m in messages:
-            if m["type"] == "user" and not m["text"].lstrip().startswith(("<command-name>", "<local-command-stdout>", "<pasted_content")):
+            if m["type"] == "user" and not m["text"].lstrip().startswith(("<command-name>", "<local-command-stdout>", "<pasted_content", "<task-notification", "<system-reminder")):
                 title = m["text"].strip().splitlines()[0][:100]
                 break
     title = title or "Imported Claude Code session"
