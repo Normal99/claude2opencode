@@ -329,6 +329,11 @@ def convert_file(path):
         "title": title,
         "location": {"directory": cwd or os.getcwd()},
     }
+    # The picker truncates long titles, so suffixes like "(continued)" are
+    # invisible and people resume the full archive by mistake. Use prefixes
+    # instead: the archive is not continuable (potentially millions of tokens
+    # of history), while the -cont child holds the recent tail and is.
+    info["title"] = "[ARCHIVE · read-only] " + info["title"][:90]
     return {"info": info, "messages": messages}
 
 
@@ -405,7 +410,7 @@ def _make_child(info, messages):
     # Deliberately a top-level session: OpenCode's session picker only lists
     # top-level sessions, and a continuation must be easy to find and resume.
     child_info.pop("parentID", None)
-    child_info["title"] = (info["title"][:80] + " (continued)")[:100]
+    child_info["title"] = "[CONTINUE HERE] " + info["title"].replace("[ARCHIVE · read-only] ", "")[:80]
     child_info["time"] = {
         "created": tail[0].get("time", {}).get("created") or info["time"]["created"],
         "updated": info["time"]["updated"],

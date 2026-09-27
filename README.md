@@ -77,11 +77,14 @@ the session picker right next to the archive as `... (continued)` — open that 
 pick up where Claude Code left off:
 
 ```
-ses_3c178070-…        Get overview and summary…      <- full archive (browse only)
-ses_3c178070-…-cont   Get overview and summary… (continued)   <- continue here
+ses_3c178070-…        [ARCHIVE · read-only] Get overview and summary…      <- browse only
+ses_3c178070-…-cont   [CONTINUE HERE] Get overview and summary…            <- resume here
 ```
 
-`import-all` imports archives first, then continuations.
+The prefixes exist because the picker truncates long titles: a "(continued)"
+suffix gets cut off and people resume the archive by mistake — where the model
+reads millions of tokens, fails, and appears to "give up". `import-all`
+imports archives first, then continuations.
 
 ## Caveats
 
