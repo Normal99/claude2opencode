@@ -36,6 +36,24 @@ PRICING = {
 }
 
 
+# Map Claude Code tool names to OpenCode equivalents where they exist, so the
+# model continuing the session sees tool names it can actually call.
+TOOL_NAME_MAP = {
+    "Bash": "bash",
+    "Read": "read",
+    "Edit": "edit",
+    "MultiEdit": "edit",
+    "Write": "write",
+    "Glob": "glob",
+    "Grep": "grep",
+    "WebFetch": "webfetch",
+    "WebSearch": "websearch",
+    "Task": "task",
+    "TodoWrite": "todowrite",
+    "TodoRead": "todoread",
+}
+
+
 def parse_ts(ts):
     if not ts:
         return 0
@@ -220,14 +238,15 @@ def convert_file(path):
                         if block.get("text"):
                             msg_content.append({"type": "text", "text": block["text"]})
                     elif btype == "thinking":
-                        if block.get("thinking"):
-                            msg_content.append({"type": "reasoning", "text": block["thinking"]})
+                        # Claude's thinking is replayed as foreign `reasoning`
+                        # content that confuses other models mid-task; drop it.
+                        continue
                     elif btype == "tool_use":
                         has_tool = True
                         tool_item = {
                             "type": "tool",
                             "id": block.get("id") or os.urandom(8).hex(),
-                            "name": block.get("name", "unknown"),
+                            "name": TOOL_NAME_MAP.get(block.get("name", ""), block.get("name", "unknown")),
                             "state": {
                                 "status": "completed",
                                 "input": block.get("input") or {},
