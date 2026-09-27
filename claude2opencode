@@ -1,0 +1,414 @@
+#!/usr/bin/env python3
+"""Convert Claude Code session transcripts (~/.claude/projects/**/*.jsonl)
+into OpenCode session JSON, importable with `opencode session import`.
+
+Usage:
+  claude2opencode list                        # show sessions found in ~/.claude/projects
+  claude2opencode convert <jsonl> [outdir]    # convert one file to JSON (no import)
+  claude2opencode convert-all [outdir]        # convert every *.jsonl
+  claude2opencode import <converted.json>     # convert (if needed) + run opencode session import
+  claude2opencode import-all                  # convert everything and import it
+
+Cost figures are approximations based on public Anthropic list prices.
+"""
+
+import base64
+import datetime
+import glob
+import hashlib
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+from collections import defaultdict
+
+PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
+
+# Rough $/Mtok list prices for approximate cost reporting. Edit freely.
+PRICING = {
+    "opus": (15.0, 75.0),
+    "sonnet": (3.0, 15.0),
+    "haiku": (1.0, 5.0),
+    "fable": (15.0, 75.0),
+    "mythos": (15.0, 75.0),
+}
+
+
+def parse_ts(ts):
+    if not ts:
+        return 0
+    try:
+        return int(datetime.datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp() * 1000)
+    except Exception:
+        return 0
+
+
+def family(model_id):
+    m = model_id.lower()
+    for fam in ("opus", "sonnet", "haiku", "fable", "mythos"):
+        if re.search(rf"\b{fam}\b", m):
+            return fam
+    return "sonnet"
+
+
+def cost_of(model_id, usage):
+    pin, pout = PRICING[family(model_id)]
+    return (usage.get("input_tokens", 0) * pin + usage.get("output_tokens", 0) * pout) / 1e6
+
+
+def text_content(result_content):
+    """Claude tool_result content -> list of OpenCode Tool.Content items."""
+    out = []
+    if isinstance(result_content, str):
+        return [{"type": "text", "text": result_content}] if result_content else []
+    if isinstance(result_content, list):
+        for block in result_content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text":
+                out.append({"type": "text", "text": block.get("text", "")})
+            elif block.get("type") == "image":
+                src = block.get("source", {})
+                data = src.get("data")
+                mime = src.get("media_type", "image/png")
+                if data:
+                    out.append({
+                        "type": "file",
+                        "uri": f"data:{mime};base64,{data}",
+                        "mime": mime,
+                    })
+            elif block.get("type") == "tool_use":
+                continue
+    return out or [{"type": "text", "text": ""}]
+
+
+def first_text(result_content):
+    for item in text_content(result_content):
+        if item.get("type") == "text" and item.get("text"):
+            return item["text"]
+    return "tool error"
+
+
+def convert_file(path):
+    session_id = os.path.splitext(os.path.basename(path))[0]
+    cwd = None
+    title = None
+    first_ts = last_ts = 0
+    messages = []
+    pending = {}          # tool_use_id -> content item dict in messages
+    totals = {"input": 0, "output": 0, "reasoning": 0, "cache_read": 0, "cache_write": 0}
+    total_cost = 0.0
+    main_session_id = session_id
+
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            etype = entry.get("type")
+            ts = parse_ts(entry.get("timestamp"))
+            if ts:
+                if not first_ts:
+                    first_ts = ts
+                last_ts = ts
+            if entry.get("cwd") and cwd is None:
+                cwd = entry["cwd"]
+
+            if etype == "ai-title" and not title:
+                title = entry.get("title") or title
+            if etype == "bridge-session" and entry.get("sessionId"):
+                main_session_id = entry["sessionId"]
+
+            if etype not in ("user", "assistant"):
+                continue
+            # Subagent (Task tool) sidechains are separate transcripts; skip them.
+            if entry.get("isSidechain"):
+                continue
+            meta_msgs = entry.get("isMeta")
+
+            role = entry.get("message", {}).get("role")
+            content = entry.get("message", {}).get("content")
+
+            if role == "user":
+                # tool_result blocks are folded into the matching tool entry
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "tool_result":
+                            pending.pop(block.get("tool_use_id"), None)  # placeholder
+                    for block in content:
+                        if not (isinstance(block, dict) and block.get("type") == "tool_result"):
+                            continue
+                        item = pending.get(block.get("tool_use_id"))
+                        if item is None:
+                            continue
+                        blocks = text_content(block.get("content"))
+                        if block.get("is_error"):
+                            item["state"] = {
+                                "status": "error",
+                                "input": item["state"].get("input", {}),
+                                "error": {"type": "tool", "message": first_text(block.get("content"))[:2000]},
+                                "content": blocks,
+                            }
+                        else:
+                            item["state"] = {
+                                "status": "completed",
+                                "input": item["state"].get("input", {}),
+                                "content": blocks,
+                            }
+                        item["time"]["completed"] = ts
+                    # fall through: a list content may still carry real text
+                    text = "\n\n".join(
+                        b.get("text", "") for b in content
+                        if isinstance(b, dict) and b.get("type") == "text" and b.get("text")
+                    )
+                    if not text or meta_msgs:
+                        continue
+                elif isinstance(content, str):
+                    text = content
+                    stripped = text.lstrip()
+                    if (meta_msgs
+                            or stripped.startswith("<local-command-caveat>")
+                            or stripped.startswith("<command-name>")
+                            or stripped.startswith("<local-command-stdout>")
+                            or stripped.startswith("<pasted_content")):
+                        continue
+                else:
+                    continue
+
+                messages.append({
+                    "id": "msg_" + (entry.get("uuid") or os.urandom(8).hex()),
+                    "type": "user",
+                    "time": {"created": ts or 0},
+                    "text": text,
+                })
+
+            elif role == "assistant":
+                if meta_msgs:
+                    continue
+                model = (entry.get("message", {}).get("model") or "")
+                if not model or model.startswith("<synthetic>"):
+                    continue
+                usage = entry.get("message", {}).get("usage", {}) or {}
+                usage = {
+                    "input_tokens": usage.get("input_tokens", 0) or 0,
+                    "output_tokens": usage.get("output_tokens", 0) or 0,
+                    "cache_read_input_tokens": usage.get("cache_read_input_tokens", 0) or 0,
+                    "cache_creation_input_tokens": usage.get("cache_creation_input_tokens", 0) or 0,
+                    "thinking_tokens": ((usage.get("output_tokens_details") or {}).get("thinking_tokens") or 0),
+                }
+                totals["input"] += usage["input_tokens"]
+                totals["output"] += usage["output_tokens"]
+                totals["reasoning"] += usage["thinking_tokens"]
+                totals["cache_read"] += usage["cache_read_input_tokens"]
+                totals["cache_write"] += usage["cache_creation_input_tokens"]
+                total_cost += cost_of(model, usage)
+
+                msg_content = []
+                has_tool = False
+                for block in (entry.get("message", {}).get("content") or []):
+                    if not isinstance(block, dict):
+                        continue
+                    btype = block.get("type")
+                    if btype == "text":
+                        if block.get("text"):
+                            msg_content.append({"type": "text", "text": block["text"]})
+                    elif btype == "thinking":
+                        if block.get("thinking"):
+                            msg_content.append({"type": "reasoning", "text": block["thinking"]})
+                    elif btype == "tool_use":
+                        has_tool = True
+                        tool_item = {
+                            "type": "tool",
+                            "id": block.get("id") or os.urandom(8).hex(),
+                            "name": block.get("name", "unknown"),
+                            "state": {
+                                "status": "completed",
+                                "input": block.get("input") or {},
+                                "content": [{"type": "text", "text": ""}],
+                            },
+                            "time": {"created": ts or 0},
+                        }
+                        pending[tool_item["id"]] = tool_item
+                        msg_content.append(tool_item)
+
+                if not msg_content:
+                    continue
+                stop = entry.get("message", {}).get("stop_reason") or ""
+                finish = (
+                    "tool-calls" if has_tool else
+                    "length" if stop == "max_tokens" else
+                    "content-filter" if stop == "refusal" else
+                    "stop"
+                )
+                msg_id = "msg_" + ((entry.get("message", {}).get("id") or "x" + (entry.get("uuid") or os.urandom(8).hex())))
+                prev = messages[-1] if messages else None
+                if prev is not None and prev.get("type") == "assistant" and prev.get("id") == msg_id:
+                    # Claude Code emits one JSONL line per content block with the
+                    # same message.id; merge into a single message.
+                    prev["content"].extend(msg_content)
+                    prev["finish"] = finish
+                    prev["time"]["completed"] = ts or prev["time"]["completed"]
+                    continue
+                messages.append({
+                    "id": msg_id,
+                    "type": "assistant",
+                    "time": {"created": ts or 0, "completed": ts or 0},
+                    "agent": "build",
+                    "model": {"providerID": "anthropic", "id": model},
+                    "content": msg_content,
+                    "finish": finish,
+                    "cost": round(cost_of(model, usage), 10),
+                    "tokens": {
+                        "input": usage["input_tokens"],
+                        "output": usage["output_tokens"],
+                        "reasoning": usage["thinking_tokens"],
+                        "cache": {"read": usage["cache_read_input_tokens"], "write": usage["cache_creation_input_tokens"]},
+                    },
+                })
+
+    # Tools whose result never arrived: mark error so the schema is satisfied.
+    for item in pending.values():
+        if item["state"].get("status") == "completed" and item["state"]["content"] == [{"type": "text", "text": ""}]:
+            item["state"] = {
+                "status": "error",
+                "input": item["state"].get("input", {}),
+                "error": {"type": "tool", "message": "(no result recorded)"},
+                "content": [{"type": "text", "text": "(no result recorded)"}],
+            }
+
+    if not messages:
+        return None
+
+    if not title:
+        for m in messages:
+            if m["type"] == "user" and not m["text"].lstrip().startswith(("<command-name>", "<local-command-stdout>", "<pasted_content")):
+                title = m["text"].strip().splitlines()[0][:100]
+                break
+    title = title or "Imported Claude Code session"
+
+    project_id = None
+    if cwd:
+        try:
+            db = subprocess.run(["opencode", "debug", "paths", "db"], capture_output=True, text=True).stdout.strip()
+            conn = sqlite3.connect(db)
+            row = conn.execute(
+                "SELECT project_id FROM project_directory WHERE directory = ? LIMIT 1", (cwd,)
+            ).fetchone()
+            if not row:
+                row = conn.execute(
+                    "SELECT id FROM project WHERE worktree = ? LIMIT 1", (cwd,)
+                ).fetchone()
+            if row:
+                project_id = row[0]
+            conn.close()
+        except Exception:
+            pass
+    if not project_id:
+        project_id = hashlib.sha1(cwd.encode()).hexdigest()[:40] if cwd else "global"
+
+    info = {
+        "id": "ses_" + main_session_id,
+        "projectID": project_id,
+        "agent": "build",
+        "cost": round(total_cost, 6),
+        "tokens": {
+            "input": totals["input"],
+            "output": totals["output"],
+            "reasoning": totals["reasoning"],
+            "cache": {"read": totals["cache_read"], "write": totals["cache_write"]},
+        },
+        "outcome": "succeeded",
+        "time": {"created": first_ts, "updated": last_ts},
+        "title": title,
+        "location": {"directory": cwd or os.getcwd()},
+    }
+    return {"info": info, "messages": messages}
+
+
+def out_path_for(jsonl, outdir):
+    os.makedirs(outdir, exist_ok=True)
+    return os.path.join(outdir, os.path.basename(jsonl).replace(".jsonl", ".import.json"))
+
+
+def convert(jsonl, outdir="/tmp/opencode/import"):
+    result = convert_file(jsonl)
+    if result is None:
+        print(f"  SKIP (no messages): {jsonl}")
+        return None
+    n = len(result["messages"])
+    dest = out_path_for(jsonl, outdir)
+    with open(dest, "w", encoding="utf-8") as f:
+        json.dump(result, f)
+    info = result["info"]
+    print(f"converted {n:>5} msgs  ->  {dest}")
+    print(f"         id={info['id']}  title={info['title'][:60]!r}  dir={info['location']['directory']}")
+    return dest
+
+
+def do_import(json_file):
+    info = json.load(open(json_file))["info"]
+    cmd = ["opencode", "session", "import", json_file, "--directory", info["location"]["directory"]]
+    print("$", " ".join(cmd))
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        print(proc.stdout)
+        print(proc.stderr)
+        return False
+    print(proc.stdout.strip() or "imported")
+    return True
+
+
+def main():
+    argv = sys.argv[1:]
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return
+    cmd, *rest = argv
+    outdir = "/tmp/opencode/import"
+
+    if cmd == "list":
+        files = sorted(glob.glob(os.path.join(PROJECTS_DIR, "*", "*.jsonl")))
+        for f in files:
+            try:
+                first = None
+                with open(f) as fh:
+                    for line in fh:
+                        d = json.loads(line)
+                        if d.get("type") == "user" and not d.get("isMeta"):
+                            c = d.get("message", {}).get("content")
+                            if isinstance(c, str):
+                                first = c.strip().splitlines()[0][:70]
+                                break
+                size = os.path.getsize(f)
+                print(f"{f}\n    {size/1e6:.1f}MB  {first!r}")
+            except Exception as e:
+                print(f"{f}  (error: {e})")
+    elif cmd == "convert":
+        convert(rest[0], rest[1] if len(rest) > 1 else outdir)
+    elif cmd == "convert-all":
+        outdir = rest[0] if rest else outdir
+        for f in sorted(glob.glob(os.path.join(PROJECTS_DIR, "*", "*.jsonl"))):
+            convert(f, outdir)
+    elif cmd == "import":
+        do_import(rest[0])
+    elif cmd == "import-all":
+        files = [out_path_for(f, outdir) for f in sorted(glob.glob(os.path.join(PROJECTS_DIR, "*", "*.jsonl")))]
+        for f in files:
+            if not os.path.exists(f):
+                src = f.replace(".import.json", ".jsonl")
+                if convert(src, outdir) is None:
+                    continue
+            if do_import(f):
+                pass
+    else:
+        print(__doc__)
+
+
+if __name__ == "__main__":
+    main()
