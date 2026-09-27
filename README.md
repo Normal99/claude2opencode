@@ -64,6 +64,25 @@ Converted files are written to `/tmp/opencode/import/` by default (pass a differ
 `<pasted_content>` marker blobs, `<local-command-caveat>` caveats, and subagent
 (sidechain) transcripts.
 
+## Continuing very long conversations
+
+A full transcript import is an **archive**: it renders fine, but you cannot send a
+message in it, because no model can ingest hundreds of thousands of tokens of history.
+OpenCode's compaction can't fix that either — the summary request is itself too long.
+
+For every transcript whose history exceeds a small token budget, the converter therefore
+emits a **second file**: a compact *continuation* session (`<uuid>.cont.import.json`)
+holding only the most recent tail (≈15k–22k tokens, truncated if needed). It appears in
+the session picker right next to the archive as `... (continued)` — open that one to
+pick up where Claude Code left off:
+
+```
+ses_3c178070-…        Get overview and summary…      <- full archive (browse only)
+ses_3c178070-…-cont   Get overview and summary… (continued)   <- continue here
+```
+
+`import-all` imports archives first, then continuations.
+
 ## Caveats
 
 - Cost figures are approximations based on public Anthropic list prices; edit the

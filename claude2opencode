@@ -101,7 +101,6 @@ def convert_file(path):
     totals = {"input": 0, "output": 0, "reasoning": 0, "cache_read": 0, "cache_write": 0}
     total_cost = 0.0
     main_session_id = session_id
-
     with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -333,9 +332,95 @@ def convert_file(path):
     return {"info": info, "messages": messages}
 
 
-def out_path_for(jsonl, outdir):
+# Very long transcripts cannot be continued directly: no model can ingest the
+# whole history. Alongside the full archive we emit a small child session
+# holding only the most recent tail, which fits a normal context window.
+TAIL_TOKEN_BUDGET = 22000
+
+
+def _estimate_tokens(m):
+    if m.get("type") == "assistant":
+        t = m.get("tokens") or {}
+        return (t.get("output") or 0) + (t.get("reasoning") or 0)
+    return max(1, len(m.get("text", "")) // 4)
+
+
+def _truncate(m, limit=2000):
+    """Shrink oversized texts in a message so a tail fits any context window."""
+    def cut(s):
+        return s if len(s) <= limit else s[:limit] + "\n…[truncated]"
+    if m.get("type") == "user":
+        m["text"] = cut(m.get("text", ""))
+    elif m.get("type") == "assistant":
+        for c in m.get("content", []):
+            if c.get("type") == "text":
+                c["text"] = cut(c.get("text", ""))
+            elif c.get("type") == "reasoning":
+                c["text"] = cut(c.get("text", ""))
+            elif c.get("type") == "tool":
+                state = c.get("state") or {}
+                for tc in state.get("content", []):
+                    if tc.get("type") == "text":
+                        tc["text"] = cut(tc.get("text", ""))
+                if len(json.dumps(state.get("input") or {})) > 4000:
+                    state["input"] = {"_truncated": True}
+    return m
+
+
+def _make_child(info, messages):
+    """Build a small 'continued' child session with the recent tail."""
+    sizes = [_estimate_tokens(m) for m in messages]
+    start = len(messages)
+    total = 0
+    for i in range(len(messages) - 1, -1, -1):
+        if total + sizes[i] > TAIL_TOKEN_BUDGET:
+            break
+        total += sizes[i]
+        start = i
+    # keep the tail starting on a user message so it reads coherently
+    while start < len(messages) and messages[start].get("type") != "user":
+        start += 1
+    if start >= len(messages) - 2:      # even the newest messages blew the budget
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("type") == "user" and not messages[i].get("text", "").startswith("[Image:"):
+                start = i
+                break
+        if start >= len(messages) - 2:
+            return None
+        tail = [json.loads(json.dumps(m)) for m in messages[start:]]
+        for m in tail:
+            _truncate(m)
+    else:
+        tail = [json.loads(json.dumps(m)) for m in messages[start:]]
+        if total > TAIL_TOKEN_BUDGET:
+            # individual messages were huge; shrink them so the child stays usable
+            for m in tail:
+                _truncate(m)
+    # message ids are globally unique in the database; the child would collide
+    # with the parent archive, so remap them deterministically.
+    for i, m in enumerate(tail):
+        m["id"] = "msg_" + hashlib.sha1((info["id"] + ":" + m["id"]).encode()).hexdigest()[:28]
+    child_info = dict(info)
+    child_info["id"] = info["id"] + "-cont"
+    # Deliberately a top-level session: OpenCode's session picker only lists
+    # top-level sessions, and a continuation must be easy to find and resume.
+    child_info.pop("parentID", None)
+    child_info["title"] = (info["title"][:80] + " (continued)")[:100]
+    child_info["time"] = {
+        "created": tail[0].get("time", {}).get("created") or info["time"]["created"],
+        "updated": info["time"]["updated"],
+    }
+    child_info["tokens"] = {
+        "input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0},
+    }
+    child_info["cost"] = 0
+    return {"info": child_info, "messages": tail}
+
+
+def out_path_for(jsonl, outdir, suffix=""):
     os.makedirs(outdir, exist_ok=True)
-    return os.path.join(outdir, os.path.basename(jsonl).replace(".jsonl", ".import.json"))
+    name = os.path.basename(jsonl).replace(".jsonl", suffix + ".import.json")
+    return os.path.join(outdir, name)
 
 
 def convert(jsonl, outdir="/tmp/opencode/import"):
@@ -350,6 +435,13 @@ def convert(jsonl, outdir="/tmp/opencode/import"):
     info = result["info"]
     print(f"converted {n:>5} msgs  ->  {dest}")
     print(f"         id={info['id']}  title={info['title'][:60]!r}  dir={info['location']['directory']}")
+    child = _make_child(info, result["messages"])
+    if child is not None:
+        cdest = out_path_for(jsonl, outdir, suffix=".cont")
+        with open(cdest, "w", encoding="utf-8") as f:
+            json.dump(child, f)
+        print(f"  + tail {len(child['messages']):>3} msgs  ->  {cdest}")
+        print(f"         id={child['info']['id']}  (import the archive above first)")
     return dest
 
 
@@ -400,14 +492,15 @@ def main():
     elif cmd == "import":
         do_import(rest[0])
     elif cmd == "import-all":
-        files = [out_path_for(f, outdir) for f in sorted(glob.glob(os.path.join(PROJECTS_DIR, "*", "*.jsonl")))]
-        for f in files:
-            if not os.path.exists(f):
-                src = f.replace(".import.json", ".jsonl")
-                if convert(src, outdir) is None:
+        for f in sorted(glob.glob(os.path.join(PROJECTS_DIR, "*", "*.jsonl"))):
+            main = out_path_for(f, outdir)
+            child = out_path_for(f, outdir, suffix=".cont")
+            if not os.path.exists(main):
+                if convert(f, outdir) is None:
                     continue
-            if do_import(f):
-                pass
+            do_import(main)
+            if os.path.exists(child):
+                do_import(child)
     else:
         print(__doc__)
 
